@@ -672,13 +672,17 @@ class OneBotApi:
                     read_supported = False
             if index + 1 >= len(candidates):
                 break
+            # 读不回就无法确认上一次调用是否已经落到协议端：无论是参数错、
+            # action 名不存在还是含糊响应，都不再换变体重复执行有副作用的
+            # action（PR #289 审查：premature-action-retry）
+            if not read_supported:
+                break
             # 明确成功过就只在纯新增变体之间再试一次，绝不进入覆盖型接口
             # （PR #289 审查：premature-failure-after-explicit-success）
             if explicit_ok_absent and candidates[index + 1][0] != "add_group_tag":
                 break
             # 读回确认"确实没加上"时可以安全换变体（add 是纯新增语义）；
-            # 读不回来时只有"action/参数不被接受"才换，含糊响应一律停手，
-            # 避免重复执行有副作用的 action
+            # 含糊响应一律停手，避免重复执行有副作用的 action
             if not self._failure_invites_retry(
                     last, action,
                     ambiguous_retry=confirmed_absent or explicit_ok_absent):
@@ -876,34 +880,52 @@ class OneBotApi:
         return False, last, "read_failed"
 
     @staticmethod
-    def _failure_says_action_unsupported(result) -> bool:
-        """失败是否明确表示"这个 action 名/接口本身不被接受"。
+    def _failure_text(result) -> str:
+        """提取失败响应里的可读文案（统一小写），供分级判定使用。"""
+        if result is None:
+            return ""
+        if isinstance(result, dict):
+            return " ".join(
+                str(result.get(k, "")) for k in
+                ("message", "msg", "wording", "error", "errmsg")
+            ).lower()
+        return str(result).lower()
 
-        只用来决定能不能降级到覆盖型兼容接口：只有接口名压根不存在才需要换名字；
-        参数名不对应该换参数变体，权限不足/标签预置限制/群号错误应该直接停手
-        （PR #289 审查：unsafe-overwrite-fallback）。
+    @staticmethod
+    def _failure_says_param_unsupported(result) -> bool:
+        """失败是否只指向"参数名/参数值不被接受"（不是 action 名不存在）。"""
+        text = OneBotApi._failure_text(result)
+        return bool(text.strip()) and any(
+            h in text for h in ("参数", "param", "argument", "invalid arg"))
+
+    @staticmethod
+    def _failure_says_action_unsupported(result) -> bool:
+        """失败是否明确表示"这个 action 名/接口整体不存在"。
+
+        只用来决定能不能降级到覆盖型兼容接口：只有 unknown action / action not
+        found / method not found / retcode=10002 这类"接口名压根不存在"的证据
+        才需要换名字；参数类失败只该换参数变体，权限不足/标签预置限制/群号错误
+        一律直接停手（PR #289 审查：unsafe-overwrite-fallback /
+        premature-action-retry）。
         """
         if result is None:
             return False
         if isinstance(result, dict):
-            text = " ".join(
-                str(result.get(k, "")) for k in ("message", "msg", "wording", "error", "errmsg")
-            ).lower()
             try:
                 if result.get("retcode") is not None and int(result["retcode"]) == 10002:
                     return True
             except (TypeError, ValueError):
                 pass
-        else:
-            text = str(result).lower()
-        if not text.strip():
+        text = OneBotApi._failure_text(result)
+        if not text.strip() or OneBotApi._failure_says_param_unsupported(result):
             return False
         blockers = ("权限", "permission", "forbidden", "denied", "not admin",
                     "群号", "group not", "tag not", "标签")
         if any(b in text for b in blockers):
             return False
         hints = ("unknown action", "unknown method", "no such action", "action not found",
-                 "unimplemented", "not support", "unsupported", "不支持", "未实现")
+                 "method not found", "unimplemented", "not support", "unsupported",
+                 "不支持", "未实现")
         return any(h in text for h in hints)
 
     @staticmethod

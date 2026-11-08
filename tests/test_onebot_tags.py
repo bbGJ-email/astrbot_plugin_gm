@@ -322,6 +322,37 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(warn, "")
         self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
 
+    async def test_param_failure_without_read_stops_after_one_call(self):
+        # 读不回来就没法确认上一次是否已生效，参数错也不能当重试依据
+        # （PR #289 审查：premature-action-retry）
+        api = self.make_api(None, {"status": "failed", "wording": "参数错误"})
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签C")
+        self.assertFalse(ok)
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"])
+
+
+class FailureClassificationTests(unittest.TestCase):
+    """固定"action 名不存在"与"参数不被接受"的分级判定。"""
+
+    def test_unknown_action_is_name_level(self):
+        self.assertTrue(OneBotApi._failure_says_action_unsupported(
+            {"status": "failed", "wording": "unknown action"}))
+        self.assertTrue(OneBotApi._failure_says_action_unsupported(
+            {"retcode": 10002}))
+        self.assertFalse(OneBotApi._failure_says_param_unsupported(
+            {"wording": "unknown action"}))
+
+    def test_param_error_is_not_name_level(self):
+        for payload in ({"wording": "参数错误"}, {"wording": "unsupported parameter"}):
+            self.assertTrue(OneBotApi._failure_says_param_unsupported(payload))
+            self.assertFalse(OneBotApi._failure_says_action_unsupported(payload))
+
+    def test_permission_error_is_neither(self):
+        payload = {"wording": "permission denied"}
+        self.assertFalse(OneBotApi._failure_says_action_unsupported(payload))
+        self.assertFalse(OneBotApi._failure_says_param_unsupported(payload))
+        self.assertFalse(OneBotApi._failure_invites_retry(payload, "add_group_tag"))
+
 
 class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
     """覆盖型 set_group_tag 只能"读得通"时才用，且要补回被挤掉的旧标签。
